@@ -1,0 +1,84 @@
+# syntax=docker/dockerfile:1
+# ──────────────────────────────────────────────────────────────────
+# Standalone all-in-one image
+# Embeds PostgreSQL — no Redis required (rate limiting disabled)
+# Managed by supervisord: postgres + next.js app
+# ──────────────────────────────────────────────────────────────────
+
+# ── Stage 1: Install dependencies ────────────────────────────────
+FROM --platform=$BUILDPLATFORM oven/bun:debian AS deps
+WORKDIR /app
+COPY package.json bun.lockb* ./
+RUN bun install --frozen-lockfile
+
+# ── Stage 2: Build Next.js app ────────────────────────────────────
+FROM deps AS builder
+COPY . .
+
+ARG APP_VERSION=dev
+ENV NEXT_TELEMETRY_DISABLED=1
+ENV NEXT_PUBLIC_APP_VERSION=$APP_VERSION
+# Placeholder DSN/Redis so instrumentation doesn't crash at build time
+ENV DSN="postgres://placeholder:placeholder@localhost:5432/placeholder"
+ENV REDIS_URL="redis://localhost:6379"
+ENV CI=true
+
+RUN --mount=type=cache,target=/app/.next/cache bun run build
+
+# ── Stage 3: Runtime image (PostgreSQL + Node.js + supervisord) ───
+FROM node:20-slim AS runner
+
+# Install PostgreSQL 16 from official apt repo + supervisord + gosu
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        gnupg \
+        gosu \
+        supervisor && \
+    # Add PostgreSQL official APT repository (bookworm → pg16)
+    curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+        | gpg --dearmor -o /etc/apt/keyrings/pgdg.gpg && \
+    echo "deb [signed-by=/etc/apt/keyrings/pgdg.gpg] https://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" \
+        > /etc/apt/sources.list.d/pgdg.list && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends postgresql-16 && \
+    apt-get purge -y --auto-remove gnupg && \
+    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+# Add postgres binaries to PATH
+ENV PATH="/usr/lib/postgresql/16/bin:${PATH}"
+
+WORKDIR /app
+
+ENV NODE_ENV=production
+ENV PORT=3000
+ENV HOST=0.0.0.0
+ENV HOSTNAME=0.0.0.0
+ENV ENABLE_RATE_LIMIT=false
+ENV AUTO_MIGRATE=true
+
+# Copy Next.js build artifacts
+COPY --from=builder /app/public         ./public
+COPY --from=builder /app/drizzle        ./drizzle
+COPY --from=builder /app/messages       ./messages
+COPY --from=builder /app/.next/standalone ./
+COPY --from=builder /app/.next/server   ./.next/server
+COPY --from=builder /app/.next/static   ./.next/static
+COPY --from=builder /app/VERSION        ./VERSION
+
+# Copy process management config
+COPY deploy/standalone/supervisord.conf /etc/supervisor/conf.d/supervisord.conf
+COPY deploy/standalone/entrypoint.sh   /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+# Ensure postgres data dir exists with correct ownership
+RUN mkdir -p /var/lib/postgresql/data && \
+    chown -R postgres:postgres /var/lib/postgresql/data
+
+EXPOSE 3000
+
+# Volumes for data persistence
+VOLUME ["/var/lib/postgresql/data"]
+
+ENTRYPOINT ["/entrypoint.sh"]
